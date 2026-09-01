@@ -1,0 +1,20 @@
+schema_version = 1
+plugin_id = "org.jeschete.retroarch-overlay.dragonwarrior3"
+slug = "dragonwarrior3"
+name = "Dragon Warrior 3"
+api_version = 1
+entry = "plugin.py"
+license = "MIT"
+
+[match]
+cores = []
+content_hints = ["dragonwarrior3"]
+hashes = []
+
+[[sources]]
+id = "dragonwarrior3"
+kind = "git-submodule"
+path = "decomp_reference/DragonWarrior3"
+required = false
+url = "https://github.com/zeromus/DragonWarrior3.git"
+required_files = []
