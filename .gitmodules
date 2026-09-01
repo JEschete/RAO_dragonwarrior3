@@ -1,0 +1,3 @@
+[submodule "decomp_reference/DragonWarrior3"]
+	path = decomp_reference/DragonWarrior3
+	url = https://github.com/zeromus/DragonWarrior3.git
