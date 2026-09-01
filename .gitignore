@@ -2,6 +2,8 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .coverage
+resources/*
+!resources/.gitkeep
 *.gba
 *.gb
 *.gbc
