@@ -8,8 +8,8 @@ license = "MIT"
 ra_game_id = 1667
 
 [match]
-cores = []
-content_hints = ["dragonwarrior3"]
+cores = ["mesen", "nes"]
+content_hints = ["dragonwarrior3", "dragon warrior iii", "dragon quest iii"]
 hashes = [
     "16a03048ce659d3d733026b6b72f2470",
     "53c1b36072390deb0c1f4d435cf2e41f",
@@ -25,4 +25,5 @@ kind = "git-submodule"
 path = "decomp_reference/DragonWarrior3"
 required = false
 url = "https://github.com/zeromus/DragonWarrior3.git"
+revision = "b35d5fd2046c33254f4387aa92bd3bce730f6c97"
 required_files = []
