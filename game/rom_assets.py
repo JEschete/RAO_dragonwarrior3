@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
+import shutil
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable
@@ -12,7 +14,30 @@ from .battle import EnemyProfile
 from .manifest import RA_HASHES
 
 
-EXTRACTOR_VERSION = 4
+def _extractor_version(*renderers: object) -> str:
+    """Cache key covering everything that decides what a generated map looks like.
+
+    Hashes this module plus the source of whichever renderers are wired in, so
+    editing either invalidates the cache by itself. A hand-maintained number
+    only works while nobody forgets to raise it, and forgetting is silent: the
+    stale PNG is then served forever.
+    """
+    paths = {Path(__file__)}
+    for renderer in renderers:
+        module = inspect.getmodule(renderer)
+        path = getattr(module, "__file__", None)
+        if path:
+            paths.add(Path(path))
+
+    digest = hashlib.sha256()
+    for path in sorted(str(item) for item in paths):
+        try:
+            digest.update(Path(path).read_bytes())
+        except OSError:
+            # An unreadable module weakens the key but cannot corrupt it; the
+            # readable ones still change the digest whenever they are edited.
+            digest.update(path.encode())
+    return digest.hexdigest()[:12]
 AREA_MAP_COUNT = 256
 MAX_MAP_DIMENSION = 128
 MAX_DECODE_OPERATIONS = 1_000_000
@@ -21,6 +46,8 @@ AREA_TILE_OVERRIDE_TABLE_OFFSET = 0x2D30
 AREA_TILE_OVERRIDE_COUNT = 17
 AREA_EXPLICIT_PATTERN_REFS_OFFSET = 0x2DD4
 AREA_PATTERN_DELTAS_OFFSET = 0x3456
+AREA_ATTRIBUTE_TABLE_OFFSET = 0x34DC
+AREA_ATTRIBUTE_INDEX_OFFSET = 0x3594
 AREA_PALETTE_DATA1_OFFSET = 0x251B
 AREA_PALETTE_DATA2_OFFSET = 0x251F
 AREA_PALETTE_DATA0_OFFSET = 0x2521
@@ -281,6 +308,7 @@ class AreaGraphics:
     attributes: tuple[int, ...]
     patterns: tuple[bytes, ...]
     palette: tuple[int, ...]
+    collision: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -408,6 +436,7 @@ class MdecDecoder:
             raise ValueError(f"Invalid MDEC dimensions: {self.width}x{self.height}")
         self._pointer_bits = max(1, (self.width * self.height - 1).bit_length())
         self._tile_bits = ((header >> 6) & 0x03) + 2
+        self.oob_tile = header & 0x1F
         clear_tile = self._reader.read(self._tile_bits)
         self.tiles = [[clear_tile for _ in range(self.width)] for _ in range(self.height)]
         self._operations = 0
@@ -443,10 +472,23 @@ class MdecDecoder:
                 right, bottom = self._point()
                 if right < left or bottom < top:
                     raise ValueError("Invalid MDEC fill rectangle")
-                step = 2 if large else 1
-                for y in range(top, bottom + 1, step):
-                    for x in range(left, right + 1, step):
-                        self._emit(x, y, brush, large, overlay)
+                columns, rows = right - left, bottom - top
+                if large:
+                    columns //= 2
+                    rows //= 2
+                # The overlay pass writes single tiles even for a large brush,
+                # so it covers the top-left quarter of the box one tile at a
+                # time; the first pass steps a whole metatile at once.
+                step = 1 if overlay else (2 if large else 1)
+                for row in range(rows + 1):
+                    for column in range(columns + 1):
+                        self._emit(
+                            left + column * step,
+                            top + row * step,
+                            brush,
+                            large and not overlay,
+                            overlay,
+                        )
                 continue
             if command == 2:
                 x, y = self._point()
@@ -472,14 +514,16 @@ class MdecDecoder:
                             continue
                         else:
                             break
+                    # A large brush advances a whole metatile per step.
+                    stride = 2 if large else 1
                     if direction == 0:
-                        y -= 1
+                        y -= stride
                     elif direction == 1:
-                        x += 1
+                        x += stride
                     elif direction == 2:
-                        y += 1
+                        y += stride
                     else:
-                        x -= 1
+                        x -= stride
                     self._emit(x, y, brush, large, overlay)
                 continue
             if command == 3:
@@ -562,7 +606,10 @@ class DragonWarrior3RomAssets:
         self._data = data
         self._prg_offset = prg_offset
         self.content_hash = content_hash
-        self.cache_directory = state_directory / "generated-assets" / content_hash / f"v{EXTRACTOR_VERSION}"
+        self.extractor_version = _extractor_version(renderer, world_renderer)
+        versions = state_directory / "generated-assets" / content_hash
+        self.cache_directory = versions / f"v{self.extractor_version}"
+        self._discard_stale_caches(versions)
         self._renderer = renderer
         self._world_renderer = world_renderer
         self._descriptors = self._index_area_maps()
@@ -1201,8 +1248,12 @@ class DragonWarrior3RomAssets:
         output = self.cache_directory / "maps" / f"area-{map_id:02x}.png"
         if output.is_file():
             return output
-        tiles = MdecDecoder(self._data, descriptor.data_offset).decode()
-        self._renderer(tiles, self._area_graphics(descriptor), output)
+        decoder = MdecDecoder(self._data, descriptor.data_offset)
+        graphics = self._area_graphics(descriptor)
+        tiles = self._apply_wall_faces(
+            decoder.decode(), graphics.collision, descriptor.tileset, decoder.oob_tile
+        )
+        self._renderer(tiles, graphics, output)
         self._write_manifest()
         return output
 
@@ -1237,6 +1288,7 @@ class DragonWarrior3RomAssets:
         references: list[int] = []
         metatiles = []
         attributes = []
+        collision = [record[2] for record in records]
         for flags, base_pattern, _ in records:
             attributes.append((flags >> 2) & 0x03)
             if flags >> 4 == 0x0F:
@@ -1274,6 +1326,10 @@ class DragonWarrior3RomAssets:
                 rendered.append(references.index(reference))
             metatiles.append(tuple(rendered))
 
+        explicit_attributes = self._area_tile_attributes(descriptor.map_id)
+        if explicit_attributes is not None:
+            attributes[:len(explicit_attributes)] = explicit_attributes
+
         override_table = bank5 + AREA_TILE_OVERRIDE_TABLE_OFFSET
         for index in range(AREA_TILE_OVERRIDE_COUNT):
             offset = override_table + index * 4
@@ -1293,6 +1349,94 @@ class DragonWarrior3RomAssets:
             tuple(attributes[:32]),
             patterns,
             self._area_palette(descriptor.map_id, descriptor.tileset),
+            tuple(collision[:32]),
+        )
+
+    @staticmethod
+    def _apply_wall_faces(
+        tiles: tuple[tuple[int, ...], ...],
+        collision: tuple[int, ...],
+        tileset: int,
+        oob_tile: int,
+    ) -> tuple[tuple[int, ...], ...]:
+        """Swap wall tiles for their exposed-face variants.
+
+        The engine runs this over every decoded map. A wall tile that is not
+        resting on more of the same wall shows its face instead, so the map
+        data only ever stores the plain variant.
+        """
+        if len(collision) < 32:
+            return tiles
+
+        faces: dict[int, int] = {}
+        for index, flags in enumerate(collision):
+            if flags & 0x70 in {0x50, 0x60, 0x70}:
+                faces[((flags & 0x30) - 0x10) >> 4] = index
+        if not faces:
+            return tiles
+
+        rows = [list(row) for row in tiles]
+        height = len(rows)
+        for y, row in enumerate(rows):
+            for x, value in enumerate(row):
+                kind = collision[value & 0x1F] & 0x70
+                if not kind or kind >= 0x40:
+                    continue
+                if y + 1 >= height:
+                    below = oob_tile
+                    exposed = not collision[below & 0x1F] & 0x70
+                else:
+                    below = tiles[y + 1][x]
+                    if (below & 0xE0) == (value & 0xE0):
+                        exposed = not collision[below & 0x1F] & 0x70
+                    elif tileset >= 0x19:
+                        exposed = (below & 0x1F) == oob_tile and not (
+                            collision[below & 0x1F] & 0x70
+                        )
+                    elif tileset >= 0x0C:
+                        exposed = True
+                    else:
+                        exposed = bool(value & 0xE0)
+                if not exposed:
+                    continue
+                face = faces.get(((kind & 0x30) - 0x10) >> 4)
+                if face is not None:
+                    row[x] = (value & 0xE0) | face
+        return tuple(tuple(row) for row in rows)
+
+    def _area_tile_attributes(self, map_id: int) -> tuple[int, ...] | None:
+        """Palette attributes for maps that carry a dedicated attribute table.
+
+        Towns and castles keep the attributes implied by their tileset
+        descriptors. Caves, towers and the other dungeon maps instead overwrite
+        all 32 entries from a packed table of 2-bit fields, stored most
+        significant pair first.
+        """
+        if map_id == 0x08:
+            index = 0
+        elif map_id == 0x58:
+            index = 0x15
+        elif map_id == 0x5B:
+            index = 0x16
+        elif map_id == 0x85:
+            index = 0x17
+        elif map_id < 0x2D or 0x41 <= map_id < 0x9F:
+            return None
+        elif map_id < 0x41:
+            index = map_id - 0x2C
+        else:
+            index = map_id - 0x87
+
+        bank5 = self._address(5, 0)
+        packed = (
+            bank5
+            + AREA_ATTRIBUTE_TABLE_OFFSET
+            + self._data[bank5 + AREA_ATTRIBUTE_INDEX_OFFSET + index] * 8
+        )
+        return tuple(
+            (self._data[packed + offset] >> (6 - pair * 2)) & 0x03
+            for offset in range(8)
+            for pair in range(4)
         )
 
     @staticmethod
@@ -1410,6 +1554,23 @@ class DragonWarrior3RomAssets:
             descriptors.append(AreaMapDescriptor(map_id, tileset, width, height, data_offset))
         return tuple(descriptors)
 
+    def _discard_stale_caches(self, versions: Path) -> None:
+        """Drop generated assets left behind by other builds of the extractor.
+
+        They can never be read again, and keeping them around is how a stale
+        render survives long enough to be mistaken for a live one.
+        """
+        try:
+            stale = [
+                item
+                for item in versions.iterdir()
+                if item.is_dir() and item.name != self.cache_directory.name
+            ]
+        except OSError:
+            return
+        for item in stale:
+            shutil.rmtree(item, ignore_errors=True)
+
     def _address(self, bank: int, offset: int) -> int:
         address = self._prg_offset + bank * 0x4000 + offset
         if address < self._prg_offset or address >= len(self._data):
@@ -1424,7 +1585,7 @@ class DragonWarrior3RomAssets:
         manifest.write_text(
             json.dumps(
                 {
-                    "extractor_version": EXTRACTOR_VERSION,
+                    "extractor_version": self.extractor_version,
                     "rom_hash": self.content_hash,
                     "area_maps": [asdict(item) for item in self._descriptors],
                 },
