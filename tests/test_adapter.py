@@ -13,7 +13,7 @@ from game.adapter import (
 from game.battle import EnemyProfile
 from retroarch_overlay.core.retroachievements import RAProgress
 from retroarch_overlay.infrastructure.retroachievements import load_ra_progress
-from retroarch_overlay.models import MapOverlay, MapWaypoint, PanelRow, RetroArchStatus
+from retroarch_overlay.models import MapDocument, MapLayer, MapOverlay, MapWaypoint, PanelRow, RetroArchStatus
 from retroarch_overlay.retroarch import RetroArchError
 
 
@@ -120,10 +120,20 @@ class DragonWarrior3AdapterTests(unittest.TestCase):
         self.assertTrue(snapshot.supports_caught_filter)
         objective = next(section for section in snapshot.sections if section.title == "Current objective")
         self.assertEqual(objective.rows[0].text, "Next: recruit a full party")
+        self.assertEqual(objective.rows[2].text, "Walkthrough progress 0/20")
         self.assertEqual(
             tuple(action.label for action in objective.actions),
-            ("OPEN ROUTE PLAN", "OPEN KEY ITEM UNLOCKS", "OPEN RA PRIORITIES"),
+            (
+                "OPEN CURRENT STEPS",
+                "OPEN ROUTE PLAN",
+                "OPEN KEY ITEM UNLOCKS",
+                "OPEN RA PRIORITIES",
+            ),
         )
+        current_steps = objective.actions[0]
+        self.assertEqual(current_steps.title, "What To Do Next")
+        self.assertEqual(len(current_steps.rows), 3)
+        self.assertTrue(current_steps.rows[0].text.startswith("NOW · recruit a full party"))
         achievements = next(section for section in snapshot.sections if section.title == "RetroAchievements")
         self.assertEqual(achievements.rows[0].text, "0/50 detected this session")
         self.assertEqual(achievements.rows[1].text, "32 exact detectors active · fresh baseline")
@@ -241,10 +251,191 @@ class DragonWarrior3AdapterTests(unittest.TestCase):
         objective = next(section for section in snapshot.sections if section.title == "Current objective")
         self.assertEqual(objective.rows[0].text, "Next: orb hunt · 2/6 found")
         unlocks = next(section for section in snapshot.sections if section.title == "Unlocks")
-        self.assertEqual(unlocks.rows[0].text, "Key items 4/12")
+        self.assertEqual(unlocks.rows[0].text, "Key items 6/12")
         orbs = next(section for section in snapshot.sections if section.title == "Orb route")
         self.assertIn("Purple Orb", orbs.rows[1].text)
         self.assertEqual(orbs.actions[0].label, "OPEN ORB CHECKLIST")
+
+    def test_walkthrough_advances_through_final_key_prerequisites(self) -> None:
+        memory = FakeMemory()
+        memory.ram[0x0703] = 10
+        memory.ram[0x07C4] = 3
+        memory.ram[0x0743] = 0x80
+        memory.ram[0x077C:0x0780] = bytes((0x58, 0x59, 0x4C, 0x53))
+        memory.sram[0xB8] = 0x80
+        adapter = DragonWarrior3Adapter()
+
+        lamp_snapshot = adapter.snapshot(memory)
+        objective = next(
+            section
+            for section in lamp_snapshot.sections
+            if section.title == "Current objective"
+        )
+        self.assertEqual(objective.rows[0].text, "Next: Eginbear · Vase of Drought")
+
+        memory.ram[0x0780] = 0x52
+        vase_snapshot = adapter.snapshot(memory)
+        objective = next(
+            section
+            for section in vase_snapshot.sections
+            if section.title == "Current objective"
+        )
+        self.assertEqual(objective.rows[0].text, "Next: Shrine in the Shoals · Final Key")
+
+    def test_consumed_book_of_satori_uses_persistent_chest_flag(self) -> None:
+        memory = FakeMemory()
+        memory.ram[0x0703] = 10
+        memory.ram[0x07C4] = 3
+        memory.ram[0x0743] = 0x80
+        memory.ram[0x077C] = 0x58
+        memory.sram[0x9F] = 0x01
+        memory.sram[0xA2] = 0x80
+        memory.sram[0xB8] = 0x80
+
+        snapshot = DragonWarrior3Adapter().snapshot(memory)
+
+        objective = next(
+            section
+            for section in snapshot.sections
+            if section.title == "Current objective"
+        )
+        self.assertEqual(objective.rows[0].text, "Next: Tedanki · Lamp of Darkness")
+
+    def test_saved_ship_progress_implies_completed_early_key_route(self) -> None:
+        memory = FakeMemory()
+        memory.ram[0x0703] = 10
+        memory.ram[0x07C4] = 3
+        memory.ram[0x0743] = 0x80
+        memory.sram[0x9F] = 0x01
+        memory.sram[0xA2] = 0x80
+        memory.sram[0xB8] = 0x80
+
+        snapshot = DragonWarrior3Adapter().snapshot(memory)
+
+        objective = next(
+            section
+            for section in snapshot.sections
+            if section.title == "Current objective"
+        )
+        self.assertEqual(objective.rows[0].text, "Next: Tedanki · Lamp of Darkness")
+
+    def test_next_objective_uses_existing_world_entrance_coordinates(self) -> None:
+        memory = FakeMemory()
+        memory.ram[0x0703] = 10
+        memory.ram[0x07C4] = 3
+        memory.ram[0x0743] = 0x80
+        memory.sram[0x9F] = 0x01
+        memory.sram[0xA2] = 0x80
+        memory.sram[0xB8] = 0x80
+        document = MapDocument(
+            "Dragon Warrior III",
+            (
+                MapLayer(
+                    "world",
+                    "Main World",
+                    "World",
+                    Path("world.png"),
+                    waypoints=(MapWaypoint(42, 73, "Tedanki", kind="entrance"),),
+                ),
+            ),
+            ("objective",),
+        )
+
+        snapshot = DragonWarrior3Adapter(map_document=document).snapshot(memory)
+
+        objective = next(
+            overlay
+            for overlay in snapshot.map_overlays
+            if overlay.waypoints[0].kind == "objective"
+        )
+        self.assertEqual(objective.layer_key, "world")
+        self.assertEqual((objective.waypoints[0].x, objective.waypoints[0].y), (42, 73))
+        self.assertEqual(objective.waypoints[0].title, "Next: Tedanki · Lamp of Darkness")
+
+    def test_key_item_checklist_uses_chest_and_event_history(self) -> None:
+        memory = FakeMemory()
+        memory.sram[0x8E] = 0x08
+        memory.sram[0x94] = 0x08
+        memory.sram[0x97] = 0x40
+        memory.sram[0xA2] = 0x08
+        memory.sram[0xBF] = 0x02
+        memory.sram[0xCA] = 0x40
+
+        snapshot = DragonWarrior3Adapter().snapshot(memory)
+
+        objective = next(
+            section
+            for section in snapshot.sections
+            if section.title == "Current objective"
+        )
+        rows = next(
+            action.rows
+            for action in objective.actions
+            if action.label == "OPEN KEY ITEM UNLOCKS"
+        )
+        completed = {
+            row.text.split(":", 1)[0]
+            for row in rows
+            if row.caught
+        }
+        self.assertTrue(
+            {"Thief's Key", "Vase of Drought", "Lamp of Darkness", "Final Key", "Echoing Flute", "Sphere of Light"}
+            <= completed
+        )
+
+    def test_configured_save_merges_consumed_story_flags_into_live_sram(self) -> None:
+        live = bytearray(SRAM_READ_SIZE)
+        live[0xC8] = 0x80
+        with tempfile.TemporaryDirectory() as directory:
+            save = Path(directory) / "Dragon Warrior III.srm"
+            saved = bytearray(0x2000)
+            saved[0xB6] = 0x48
+            saved[0xB9] = 0x08
+            saved[0xBF] = 0x82
+            saved[0xCA] = 0x40
+            save.write_bytes(saved)
+
+            merged = DragonWarrior3Adapter(save_path=save)._merge_save_sram(
+                bytes(live)
+            )
+
+        self.assertEqual(merged[0xB6] & 0x48, 0x48)
+        self.assertEqual(merged[0xB9] & 0x08, 0x08)
+        self.assertEqual(merged[0xBF] & 0x82, 0x82)
+        self.assertEqual(merged[0xCA] & 0x40, 0x40)
+
+    def test_optional_leaf_does_not_skip_phantom_ship_route(self) -> None:
+        memory = FakeMemory()
+        memory.ram[0x0703] = 10
+        memory.ram[0x07C4] = 3
+        memory.ram[0x0743] = 0x80
+        memory.sram[0x8E] = 0x08
+        memory.sram[0x94] = 0x08
+        memory.sram[0x97] = 0x40
+        memory.sram[0xA2] = 0x80
+        memory.sram[0xA5] = 0x02
+        memory.sram[0xB8] = 0x80
+        memory.sram[0xCE] = 0x0F
+        adapter = DragonWarrior3Adapter(
+            RAProgress("PlayerOne", frozenset({50431}))
+        )
+
+        snapshot = adapter.snapshot(memory)
+        objective = next(
+            section
+            for section in snapshot.sections
+            if section.title == "Current objective"
+        )
+        self.assertEqual(objective.rows[0].text, "Next: Phantom Ship and Shrine Jail")
+
+        memory.ram[0x077C] = 0x11
+        snapshot = adapter.snapshot(memory)
+        objective = next(
+            section
+            for section in snapshot.sections
+            if section.title == "Current objective"
+        )
+        self.assertEqual(objective.rows[0].text, "Next: finish the orb hunt · 4/6 found")
 
     def test_placed_orb_is_not_reported_missing_after_item_is_consumed(self) -> None:
         memory = FakeMemory()
@@ -481,8 +672,12 @@ class DragonWarrior3AdapterTests(unittest.TestCase):
         snapshot = DragonWarrior3Adapter().snapshot(memory)
 
         objective = next(section for section in snapshot.sections if section.title == "Current objective")
-        self.assertEqual(objective.rows[0].text, "Next: Final Key route")
-        key_items = objective.actions[1].rows
+        self.assertEqual(objective.rows[0].text, "Next: Dhama and Tower of Garuna")
+        key_items = next(
+            action.rows
+            for action in objective.actions
+            if action.label == "OPEN KEY ITEM UNLOCKS"
+        )
         black_pepper = next(row for row in key_items if row.text.startswith("Black Pepper:"))
         self.assertTrue(black_pepper.caught)
 
@@ -501,7 +696,7 @@ class DragonWarrior3AdapterTests(unittest.TestCase):
             snapshot = DragonWarrior3Adapter(save_path=save).snapshot(memory)
 
         objective = next(section for section in snapshot.sections if section.title == "Current objective")
-        self.assertEqual(objective.rows[0].text, "Next: Final Key route")
+        self.assertEqual(objective.rows[0].text, "Next: Dhama and Tower of Garuna")
 
 
 if __name__ == "__main__":

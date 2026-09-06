@@ -17,6 +17,23 @@ SRAM_ADDRESS = 0x6000
 SRAM_READ_SIZE = 0x0ACC
 CHEST_FLAGS_START = 0x8E
 CHEST_FLAGS_END = 0xA8
+MAGIC_KEY_CHEST_INDEX = 143
+BOOK_OF_SATORI_CHEST_INDEX = 160
+ITEM_CHEST_INDICES = {
+    0x52: 52,
+    0x53: 73,
+    0x59: MAGIC_KEY_CHEST_INDEX,
+    0x5A: 4,
+    0x6F: 164,
+    0x71: 77,
+    0x54: 190,
+}
+ITEM_EVENT_FLAGS = {
+    0x4F: (0xBF, 0x80),
+    0x58: (0xBF, 0x02),
+    0x72: (0xCA, 0x40),
+    0x76: (0xBF, 0x08),
+}
 NPC_POSITIONS_START = 0x0110
 NPC_POSITIONS_END = 0x0174
 
@@ -107,19 +124,6 @@ ORB_HINTS = {
     0x7B: "Lancel / Gaia's Navel route",
     0x7C: "Tedanki / prisoner route",
 }
-ROUTE_PLAN = (
-    ("Recruit a full party", "Build four active characters before leaving Aliahan."),
-    ("Thief's Key", "Go to Reeve and unlock early locked-door checks."),
-    ("Magic Key", "Push toward Isis and Pyramid."),
-    ("Black Pepper", "Resolve Baharata and return to Portoga for the ship."),
-    ("Final Key", "Use the ship and Vase of Drought route."),
-    ("Orb hunt", "Collect all six orbs and place them in Liamland."),
-    ("Ramia", "Finish Liamland after all orbs are placed."),
-    ("Baramos", "Use Ramia to reach Baramos Castle."),
-    ("Alefgard", "After Baramos, push the underworld route."),
-    ("Rainbow Drop", "Build the bridge to Zoma's Castle."),
-    ("Zoma", "Finish the final route."),
-)
 SHOPPING_GOALS = (
     (0, "Save for early key and gear checks."),
     (1000, "Comfortable early-game buffer."),
@@ -150,6 +154,7 @@ class GameState:
     arena_winner: int
     arena_pick: int
     chest_flags: bytes
+    event_flags: bytes
     rainbow_bridge: bool
     rainbow_drop_obtained: bool
     alefgard_open: bool
@@ -157,6 +162,15 @@ class GameState:
     game_complete: bool
     ship_granted: bool
     ship_owned: bool
+
+
+@dataclass(frozen=True, slots=True)
+class RouteStep:
+    title: str
+    detail: str
+    section: str
+    complete: bool
+    target: str = ""
 
 
 class DragonWarrior3Adapter:
@@ -285,6 +299,9 @@ class DragonWarrior3Adapter:
         npc_overlay = self._npc_overlay(ram, map_id, map_bank, map_name, metadata)
         if npc_overlay is not None:
             map_overlays.append(npc_overlay)
+        objective_overlay = self._objective_overlay(state, area)
+        if objective_overlay is not None:
+            map_overlays.append(objective_overlay)
         return OverlaySnapshot(
             self.name,
             f"Battle · {location}" if battle else location,
@@ -350,8 +367,22 @@ class DragonWarrior3Adapter:
         return MapOverlay(f"area-{map_id:02x}", tuple(waypoints))
 
     def _objective_section(self, ram: bytes, state: GameState, area: str) -> PanelSection:
-        objective, detail = self._current_objective(state, area)
-        rows = [PanelRow(objective), PanelRow(detail)]
+        steps = self._route_steps(state, area)
+        current_index = (
+            len(steps) - 1
+            if state.game_complete
+            else next(
+                (index for index, step in enumerate(steps) if not step.complete),
+                len(steps) - 1,
+            )
+        )
+        current = steps[current_index]
+        completed = len(steps) if state.game_complete else sum(step.complete for step in steps)
+        rows = [
+            PanelRow(current.title),
+            PanelRow(current.detail),
+            PanelRow(f"Walkthrough progress {completed}/{len(steps)}"),
+        ]
         warnings = self._party_warnings(ram, state)
         if warnings:
             rows.append(PanelRow("Risk: " + " · ".join(warnings), False))
@@ -360,6 +391,11 @@ class DragonWarrior3Adapter:
             tuple(rows),
             alert=bool(warnings),
             actions=(
+                PanelAction(
+                    "OPEN CURRENT STEPS",
+                    "What To Do Next",
+                    self._current_route_rows(steps, current_index),
+                ),
                 PanelAction("OPEN ROUTE PLAN", "Dragon Warrior III Route Plan", self._route_plan_rows(state, area)),
                 PanelAction("OPEN KEY ITEM UNLOCKS", "Key Item Unlocks", self._key_item_rows(state)),
                 PanelAction("OPEN RA PRIORITIES", "RetroAchievements Priorities", self._ra_priority_rows(state)),
@@ -367,55 +403,265 @@ class DragonWarrior3Adapter:
         )
 
     def _current_objective(self, state: GameState, area: str) -> tuple[str, str]:
-        if state.game_complete:
-            return "Adventure complete", "Zoma is defeated and the Erdrick ending flag is set."
-        if self._active_count(state) < 4:
-            return "Next: recruit a full party", "Build four active party members before committing to the overworld."
-        if not self._has_item(state, 0x58):
-            return "Next: Reeve · Thief's Key", "Unlock the first door tier and early item checks."
-        if not self._has_item(state, 0x59):
-            return "Next: Isis / Pyramid · Magic Key", "Push the desert route and open the midgame door tier."
-        if not state.ship_granted and self._has_item(state, 0x4F):
-            return "Next: Portoga · deliver Black Pepper", "Complete the trade with the king to receive the ship."
-        if state.ship_granted and not state.ship_owned:
-            return "Next: Portoga · board the ship", "The ship has been granted and is waiting to be picked up."
-        if not state.ship_granted:
-            return "Next: Baharata · Black Pepper", "Finish the trade chain that leads to the ship."
-        if not self._has_item(state, 0x5A):
-            return "Next: Final Key route", "Use ship access and the Vase of Drought chain to open jail doors."
-        if state.orbs_found < 6:
-            return f"Next: orb hunt · {state.orbs_found}/6 found", "Use key-item access to clean up the six orb routes."
-        if state.orbs_placed < 6 or state.pedestals < 6:
-            return "Next: Liamland · place the orbs", "Place every orb and light the pedestals to hatch Ramia."
-        if not state.baramos_defeated:
-            return "Next: Baramos", "Use Ramia to reach Baramos Castle and defeat him."
-        if not state.alefgard_open:
-            return "Next: Aliahan · report victory", "Finish the celebration sequence to open the Alefgard passage."
-        if not state.rainbow_drop_obtained:
-            return "Next: Rainbow Drop", "Gather Alefgard requirements and build the bridge to Zoma's Castle."
-        if not state.rainbow_bridge:
-            return "Next: use the Rainbow Drop", "Create the bridge to Zoma's Castle."
-        if not self._has_item(state, 0x72):
-            return "Next: Sphere of Light", "Collect it unless you are routing the no-Sphere challenge."
-        return "Next: Zoma", "Final route is open; prepare resources and finish the game."
+        steps = self._route_steps(state, area)
+        current = (
+            steps[-1]
+            if state.game_complete
+            else next((step for step in steps if not step.complete), steps[-1])
+        )
+        return current.title, current.detail
+
+    def _route_steps(self, state: GameState, area: str) -> tuple[RouteStep, ...]:
+        complete = lambda item_id: self._key_item_completed(state, item_id)
+        magic_key_obtained = complete(0x59)
+        book_of_satori_obtained = self._item_progress_completed(state, 0x4C)
+        downstream_of_ship = state.ship_granted or book_of_satori_obtained or complete(0x53) or complete(0x5A)
+        downstream_of_dhama = complete(0x53) or complete(0x52) or complete(0x5A)
+        downstream_of_final_key = state.orbs_found > 0 or complete(0x54) or state.baramos_defeated
+        samanao_complete = (
+            complete(0x54)
+            or self._achievement_done(50431)
+            or state.orbs_found >= 5
+            or state.baramos_defeated
+        )
+        phantom_ship_complete = (
+            self._has_item(state, 0x11)
+            or self._sram_flag(state, 0xB6, 0x08)
+            or self._achievement_done(50453)
+            or state.orbs_found >= 5
+            or state.baramos_defeated
+        )
+        orb_target = self._next_orb_target(state)
+        return (
+            RouteStep(
+                "Next: recruit a full party",
+                "Visit Patty's Place and leave Aliahan with Hero, Soldier, Pilgrim, and Wizard.",
+                "Before Leaving Aliahan",
+                self._active_count(state) >= 4,
+                "Aliahan Town",
+            ),
+            RouteStep(
+                "Next: Tower of Najima · Thief's Key",
+                "Clear the Cave on the Promontory, climb Najima, then visit Reeve for the Magic Ball.",
+                "The Journey Begins",
+                complete(0x58) or downstream_of_ship,
+                "Tower of Najima 1F",
+            ),
+            RouteStep(
+                "Next: Romaly and Noaniels",
+                "Wake Noaniels, defeat Kandar at Shanpane, and return the Golden Crown before heading to Isis.",
+                "Romaly, Kanave, Noaniels, and the Golden Crown",
+                magic_key_obtained or downstream_of_ship,
+                "Romaly",
+            ),
+            RouteStep(
+                "Next: Isis / Pyramid · Magic Key",
+                "Get the Magic Key, clear the Pyramid treasure route, and collect the Golden Claw.",
+                "Assaram, Isis, and the Magic Key",
+                magic_key_obtained or downstream_of_ship,
+                "Isis Castle Throne Room",
+            ),
+            RouteStep(
+                (
+                    "Next: Portoga · board the ship"
+                    if state.ship_granted and not state.ship_owned
+                    else "Next: Baharata · Black Pepper"
+                ),
+                (
+                    "The ship has been granted and is waiting in Portoga's harbor."
+                    if state.ship_granted and not state.ship_owned
+                    else "Open Norud's passage, rescue Tania and Galen, then take Black Pepper to Portoga."
+                ),
+                "Portoga, Norud, Baharata, and the Ship",
+                state.ship_owned or downstream_of_dhama,
+                "Portoga Town" if state.ship_granted else "Baharata",
+            ),
+            RouteStep(
+                "Next: Dhama and Tower of Garuna",
+                "Get the Book of Satori, make the planned first class change, then rebuild the new class near Dhama.",
+                "Dhama, Garuna, Muor, and Class Planning",
+                book_of_satori_obtained or downstream_of_dhama,
+                "Shrine of Dhama",
+            ),
+            RouteStep(
+                "Next: Tedanki · Lamp of Darkness",
+                "Visit ruined Tedanki by day, collect the lamp, then continue through Lancel toward Eginbear.",
+                "The Final Key and Early Orb Hunt",
+                complete(0x53) or complete(0x52) or complete(0x5A) or downstream_of_final_key,
+                "Tedanki",
+            ),
+            RouteStep(
+                "Next: Eginbear · Vase of Drought",
+                "Buy an Invisibility Herb in Lancel, enter Eginbear, and solve its boulder puzzle.",
+                "The Final Key and Early Orb Hunt",
+                complete(0x52) or complete(0x5A) or downstream_of_final_key,
+                "Eginbear",
+            ),
+            RouteStep(
+                "Next: Shrine in the Shoals · Final Key",
+                "Use the Vase of Drought south of Aliahan, claim the Final Key, then return to Tedanki at night.",
+                "The Final Key and Early Orb Hunt",
+                complete(0x5A),
+                "Final Key Shrine",
+            ),
+            RouteStep(
+                f"Next: orb hunt · {state.orbs_found}/6 found",
+                "Collect the Green, Purple, Blue, and Red Orbs, start Newville, then continue to Samanao.",
+                "Jipang, Navel of the Earth, Pirates, Luzami, Soo, and Newville",
+                state.orbs_found >= 4 or samanao_complete,
+                orb_target,
+            ),
+            RouteStep(
+                "Next: Samanao · Mirror of Ra",
+                "Clear the southeast cave, expose the false king, and trade the Staff of Change in Greenlad.",
+                "Samanao, Mirror of Ra, and Staff of Change",
+                samanao_complete,
+                "Samanao",
+            ),
+            RouteStep(
+                "Next: Phantom Ship and Shrine Jail",
+                "Find the Locket of Love, lift Olivia's curse, and recover the Sword of Gaia.",
+                "Phantom Ship and Lover's Memento",
+                phantom_ship_complete,
+            ),
+            RouteStep(
+                f"Next: finish the orb hunt · {state.orbs_found}/6 found",
+                "Resolve Newville for the Yellow Orb, cross Necrogond, and receive the Silver Orb.",
+                "Necrogond, Liamland, and Baramos",
+                state.orbs_found >= 6,
+                orb_target,
+            ),
+            RouteStep(
+                "Next: Liamland · awaken Ramia",
+                "Place all six orbs and light every pedestal around the egg.",
+                "Necrogond, Liamland, and Baramos",
+                state.orbs_placed >= 6 and state.pedestals >= 6,
+                "Shrine of Liamland",
+            ),
+            RouteStep(
+                "Next: Baramos",
+                "Use Ramia to reach the castle, prepare Barrier and sustained healing, then defeat Baramos.",
+                "Necrogond, Liamland, and Baramos",
+                state.baramos_defeated,
+                "Castle of Baramos",
+            ),
+            RouteStep(
+                "Next: Aliahan · report victory",
+                "Complete the interrupted celebration, collect the Sphere of Light, and enter the Great Pit of Giaga.",
+                "The World of Darkness",
+                state.alefgard_open,
+                "Aliahan Town",
+            ),
+            RouteStep(
+                "Next: gather Alefgard's legendary items",
+                "Collect the Stone of Sunlight, Staff of Rain, Sword of Kings, Shield of Heroes, and Sacred Amulet.",
+                "The World of Darkness",
+                state.rainbow_drop_obtained or state.rainbow_bridge,
+                "Tantegel Castle",
+            ),
+            RouteStep(
+                "Next: use the Rainbow Drop",
+                "Use it northwest of Rimuldar to create the bridge to Zoma's Castle.",
+                "Rainbow Drop, Zoma's Castle, and the Ending",
+                state.rainbow_bridge,
+                "Rimuldar",
+            ),
+            RouteStep(
+                "Next: Zoma's Castle",
+                "Take the Sage's Stone, clear the guardian gauntlet, and defeat Zoma.",
+                "Rainbow Drop, Zoma's Castle, and the Ending",
+                state.game_complete,
+                "Castle of Zoma 1F",
+            ),
+            RouteStep(
+                "Adventure complete",
+                "Zoma is defeated and the Erdrick ending flag is set.",
+                "Side Activities and Final Checks",
+                state.game_complete,
+            ),
+        )
+
+    @staticmethod
+    def _next_orb_target(state: GameState) -> str:
+        targets = (
+            (0x7C, "Tedanki"),
+            (0x7A, "Jipang"),
+            (0x7B, "Lancel"),
+            (0x78, "House of Pirates"),
+            (0x79, "Soo"),
+            (0x77, "Cave of Necrogond B1"),
+        )
+        return next(
+            (target for item_id, target in targets if not DragonWarrior3Adapter._orb_collected(state, item_id)),
+            "Shrine of Liamland",
+        )
+
+    def _objective_overlay(
+        self, state: GameState, area: str
+    ) -> MapOverlay | None:
+        if self._map_document is None or state.game_complete:
+            return None
+        current = next(
+            (step for step in self._route_steps(state, area) if not step.complete),
+            None,
+        )
+        if current is None or not current.target:
+            return None
+        for layer in self._map_document.layers:
+            target = next(
+                (
+                    waypoint
+                    for waypoint in layer.waypoints
+                    if waypoint.title == current.target
+                ),
+                None,
+            )
+            if target is not None:
+                return MapOverlay(
+                    layer.key,
+                    (
+                        MapWaypoint(
+                            target.x,
+                            target.y,
+                            current.title,
+                            current.detail,
+                            "objective",
+                            marker="objective",
+                        ),
+                    ),
+                )
+        return None
+
+    def _achievement_done(self, achievement_id: int) -> bool:
+        account_ids = (
+            self._account_progress.unlocked_ids
+            if self._account_progress is not None
+            else frozenset()
+        )
+        return achievement_id in self._unlocked or achievement_id in account_ids
+
+    @staticmethod
+    def _current_route_rows(
+        steps: tuple[RouteStep, ...], current_index: int
+    ) -> tuple[PanelRow, ...]:
+        visible = steps[current_index:min(len(steps), current_index + 3)]
+        return tuple(
+            PanelRow(
+                f"{'NOW' if offset == 0 else 'THEN'} · {step.title.removeprefix('Next: ')}\n"
+                f"{step.detail}\nWalkthrough: {step.section}",
+                step.complete,
+            )
+            for offset, step in enumerate(visible)
+        )
 
     def _route_plan_rows(self, state: GameState, area: str) -> tuple[PanelRow, ...]:
-        checks = {
-            "Recruit a full party": self._active_count(state) >= 4,
-            "Thief's Key": self._has_item(state, 0x58),
-            "Magic Key": self._has_item(state, 0x59),
-            "Black Pepper": state.ship_granted,
-            "Final Key": self._has_item(state, 0x5A),
-            "Orb hunt": state.orbs_found >= 6,
-            "Ramia": state.orbs_placed >= 6 and state.pedestals >= 6,
-            "Baramos": state.baramos_defeated,
-            "Alefgard": state.alefgard_open,
-            "Rainbow Drop": state.rainbow_drop_obtained,
-            "Zoma": state.game_complete,
-        }
         return tuple(
-            PanelRow(f"{name}: {detail}", checks.get(name, False))
-            for name, detail in ROUTE_PLAN
+            PanelRow(
+                f"{step.title.removeprefix('Next: ')} · {step.section}",
+                step.complete,
+                step.detail,
+            )
+            for step in self._route_steps(state, area)[:-1]
         )
 
     def _key_item_rows(self, state: GameState) -> tuple[PanelRow, ...]:
@@ -438,8 +684,8 @@ class DragonWarrior3Adapter:
             achievement = ACHIEVEMENTS_BY_ID[achievement_id]
             if achievement_id in unlocked:
                 rows.append(PanelRow(f"{achievement.title}: done", True))
-            elif self._has_item(state, item_id):
-                rows.append(PanelRow(f"{achievement.title}: item held, not observed this session", False))
+            elif self._item_progress_completed(state, item_id):
+                rows.append(PanelRow(f"{achievement.title}: completed in save, not observed this session", False))
             else:
                 rows.append(PanelRow(f"{achievement.title}: {achievement.description}", False))
         for achievement in ACHIEVEMENTS:
@@ -452,12 +698,58 @@ class DragonWarrior3Adapter:
         return item_id in state.items
 
     @staticmethod
-    def _key_item_completed(state: GameState, item_id: int) -> bool:
-        if item_id == 0x4F:
-            return state.ship_granted or item_id in state.items
+    def _chest_open(state: GameState, global_index: int) -> bool:
+        byte_index = global_index >> 3
+        return (
+            byte_index < len(state.chest_flags)
+            and bool(
+                state.chest_flags[byte_index]
+                & (0x80 >> (global_index & 0x07))
+            )
+        )
+
+    def _key_item_completed(self, state: GameState, item_id: int) -> bool:
+        if self._item_progress_completed(state, item_id):
+            return True
+        if item_id in {0x58, 0x59, 0x4F}:
+            return state.ship_granted
+        if item_id == 0x53:
+            return self._key_item_completed(state, 0x52)
+        if item_id == 0x52:
+            return self._key_item_completed(state, 0x5A)
+        if item_id == 0x5A:
+            return state.orbs_found > 0 or state.baramos_defeated
+        if item_id == 0x54:
+            return (
+                self._sram_flag(state, 0xB9, 0x08)
+                or state.orbs_found >= 5
+                or state.baramos_defeated
+            )
+        if item_id == 0x72:
+            return state.game_complete
         if item_id == 0x76:
             return state.rainbow_bridge or state.rainbow_drop_obtained
-        return item_id in state.items
+        return False
+
+    def _item_progress_completed(self, state: GameState, item_id: int) -> bool:
+        if self._has_item(state, item_id):
+            return True
+        chest_index = (
+            BOOK_OF_SATORI_CHEST_INDEX
+            if item_id == 0x4C
+            else ITEM_CHEST_INDICES.get(item_id)
+        )
+        if chest_index is not None and self._chest_open(state, chest_index):
+            return True
+        event_flag = ITEM_EVENT_FLAGS.get(item_id)
+        if event_flag is not None and self._sram_flag(state, *event_flag):
+            return True
+        achievement_id = ITEM_ACHIEVEMENTS.get(item_id)
+        return achievement_id is not None and self._achievement_done(achievement_id)
+
+    @staticmethod
+    def _sram_flag(state: GameState, offset: int, mask: int) -> bool:
+        return offset < len(state.event_flags) and bool(state.event_flags[offset] & mask)
 
     @staticmethod
     def _orb_collected(state: GameState, item_id: int) -> bool:
@@ -647,8 +939,8 @@ class DragonWarrior3Adapter:
             PanelRow(f"Pyramid chests {state.pyramid_chests}/24", state.pyramid_chests >= 24),
             PanelRow(f"Samanao cave chests {state.samanao_chests}/23", state.samanao_chests >= 23),
             PanelRow(f"Vault slots used {vault_count}/128"),
-            PanelRow("Rainbow bridge ready" if self._has_item(state, 0x76) else "Rainbow bridge not ready", self._has_item(state, 0x76)),
-            PanelRow("Sphere of Light owned" if self._has_item(state, 0x72) else "Sphere of Light missing", self._has_item(state, 0x72)),
+            PanelRow("Rainbow bridge ready" if self._key_item_completed(state, 0x76) else "Rainbow bridge not ready", self._key_item_completed(state, 0x76)),
+            PanelRow("Sphere of Light obtained" if self._key_item_completed(state, 0x72) else "Sphere of Light missing", self._key_item_completed(state, 0x72)),
         )
 
     def _chest_rows(self, state: GameState) -> tuple[PanelRow, ...]:
@@ -719,6 +1011,7 @@ class DragonWarrior3Adapter:
             arena_winner=sram[0xA65],
             arena_pick=sram[0xA67],
             chest_flags=bytes(sram[CHEST_FLAGS_START:CHEST_FLAGS_END]),
+            event_flags=bytes(sram),
             rainbow_bridge=bool(sram[0xB6] & 0x80),
             rainbow_drop_obtained=bool(sram[0xBF] & 0x08) or 0x76 in carried_items + vault_items,
             alefgard_open=bool(sram[0xCB] & 0x10),
@@ -746,10 +1039,14 @@ class DragonWarrior3Adapter:
         for offset in range(CHEST_FLAGS_START, CHEST_FLAGS_END):
             merged[offset] |= saved_sram[offset]
         for offset, mask in (
-            (0xB6, 0x80),
-            (0xB7, 0x01),
-            (0xBF, 0x08),
+            (0xB6, 0xEA),
+            (0xB7, 0x05),
+            (0xB9, 0x88),
+            (0xBA, 0x04),
+            (0xBF, 0x9E),
+            (0xCA, 0x42),
             (0xCB, 0x90),
+            (0xCD, 0x01),
             (0xCE, 0x3F),
             (0xCF, 0x3F),
             (0xD0, 0x3F),

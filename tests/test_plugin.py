@@ -66,6 +66,6 @@ def test_factory_resolves_optional_maps_from_context_repository() -> None:
     document = adapter._map_document
     assert document is not None
     assert tuple(layer.key for layer in document.layers) == ("world", "underworld")
-    assert document.overlay_kinds == ("collectibles", "npcs")
+    assert document.overlay_kinds == ("objective", "collectibles", "npcs")
     assert (document.layers[0].offset_x, document.layers[0].offset_y) == (-3, -4)
     assert (document.layers[1].anchor_x, document.layers[1].anchor_y) == (24, 24)

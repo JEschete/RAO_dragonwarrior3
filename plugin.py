@@ -93,7 +93,7 @@ class DragonWarrior3Plugin:
         return MapDocument(
             "Dragon Warrior III",
             tuple(layers),
-            ("collectibles", "npcs"),
+            ("objective", "collectibles", "npcs"),
         )
 
 
