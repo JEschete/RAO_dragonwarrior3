@@ -139,6 +139,14 @@ TIME_WINDOWS = (
 
 
 @dataclass(frozen=True, slots=True)
+class PartyMember:
+    label: str
+    job: int
+    female: bool
+    equipment: dict[str, int]
+
+
+@dataclass(frozen=True, slots=True)
 class GameState:
     levels: tuple[int, ...]
     jobs: tuple[int, ...]
@@ -193,6 +201,10 @@ class DragonWarrior3Adapter:
         item_name: Callable[[int], str] | None = None,
         decode_text: Callable[[bytes], str] | None = None,
         enemy_profile: Callable[[int], EnemyProfile] | None = None,
+        shop_inventory: Callable[[int], tuple[object, ...]] | None = None,
+        shop_counter_nearby: Callable[[int, int, int], bool] | None = None,
+        item_slot: Callable[[int], str | None] | None = None,
+        item_power: Callable[[int], int] | None = None,
     ) -> None:
         self._previous: GameState | None = None
         self._unlocked: set[int] = set()
@@ -206,6 +218,12 @@ class DragonWarrior3Adapter:
         self._item_name = item_name
         self._decode_text = decode_text
         self._enemy_profile = enemy_profile
+        self._last_shop_id: int | None = None
+        self._shop_context: tuple[int, int] | None = None
+        self._shop_inventory = shop_inventory
+        self._shop_counter_nearby = shop_counter_nearby
+        self._item_slot = item_slot
+        self._item_power = item_power
 
     def supports(self, status: RetroArchStatus, content_hash: str | None = None) -> bool:
         core = status.core.casefold().replace(" ", "_")
@@ -255,6 +273,9 @@ class DragonWarrior3Adapter:
                 self._party_section(ram, state),
                 self._achievement_section(),
             ]
+            shop = self._shop_section(ram, map_id, coordinates)
+            if shop is not None:
+                sections.insert(0, shop)
             sections.extend(
                 (
                     self._unlock_section(state),
@@ -312,6 +333,82 @@ class DragonWarrior3Adapter:
             map_overlays=tuple(map_overlays),
             display_spec=GameDisplaySpec("nes-4-3", 4, 3),
         )
+
+    def _shop_section(
+        self, ram: bytes, map_id: int, coordinates: tuple[int, int]
+    ) -> PanelSection | None:
+        """Rank a shop's stock against what the party is actually wearing.
+
+        The shop id in RAM keeps its last value after the player walks away, so
+        it is only trusted once it has been seen to change and while the party
+        is still on that map, standing at a counter. Guessing more widely than
+        that shows one town's prices while the player stands in another.
+        """
+        if self._shop_inventory is None or self._shop_counter_nearby is None:
+            return None
+        shop_id = ram[0x06FF]
+        if self._last_shop_id is not None and shop_id != self._last_shop_id:
+            self._shop_context = (map_id, shop_id)
+        self._last_shop_id = shop_id
+        if self._shop_context != (map_id, shop_id):
+            return None
+        if not self._shop_counter_nearby(map_id, *coordinates):
+            return None
+        items = self._shop_inventory(shop_id)
+        gear = [item for item in items if item.slot is not None]
+        if not gear:
+            return None
+
+        party = self._party_equipment(ram)
+        rows: list[PanelRow] = []
+        for item in sorted(gear, key=lambda entry: entry.price):
+            upgrades = []
+            for member in party:
+                if not item.equippable_by(member.job, member.female):
+                    continue
+                equipped = member.equipment.get(item.slot)
+                current = 0 if equipped is None else self._item_power(equipped)
+                if item.power > current:
+                    upgrades.append(f"{member.label} +{item.power - current}")
+            if upgrades:
+                rows.append(
+                    PanelRow(
+                        f"{item.name} {item.price}G · {', '.join(upgrades)}",
+                        False,
+                        f"{item.slot.title()}, power {item.power}",
+                    )
+                )
+        if not rows:
+            rows.append(PanelRow("No upgrades here for this party", True))
+        gold = int.from_bytes(ram[0x07BC:0x07BF], "little")
+        rows.insert(0, PanelRow(f"Gold on hand: {gold}G"))
+        return PanelSection("Shop upgrades", tuple(rows), priority=5, role="context")
+
+    def _party_equipment(self, ram: bytes) -> tuple[PartyMember, ...]:
+        members = []
+        for index in range(4):
+            if ram[0x07C1 + index] == 0xFF:
+                continue
+            class_gender = ram[0x0718 + index]
+            equipment: dict[str, int] = {}
+            for slot_index in range(8):
+                value = ram[0x077C + index * 8 + slot_index]
+                if not value & 0x80 or value == 0xFF:
+                    continue
+                item_id = value & 0x7F
+                slot = self._item_slot(item_id) if self._item_slot else None
+                if slot is not None:
+                    equipment[slot] = item_id
+            job = class_gender & 0x07
+            members.append(
+                PartyMember(
+                    f"P{index + 1} {JOBS[job]}",
+                    job,
+                    bool((class_gender >> 3) & 1),
+                    equipment,
+                )
+            )
+        return tuple(members)
 
     def _map_name(self, area: str, map_id: int) -> str:
         if area == "World":

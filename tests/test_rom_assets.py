@@ -118,6 +118,8 @@ class RomAssetLayerTests(unittest.TestCase):
             ChestRecord(1, 3, 1, "128 gold", True),
         )
         assets._item_name = Mock(side_effect=lambda item_id: f"Item {item_id:02X}")
+        assets._descriptors = ()
+        assets._area_layouts = {}
 
         overlays = assets.collectible_overlays(bytes((0x80,)) + bytes(25))
 
@@ -135,6 +137,8 @@ class RomAssetLayerTests(unittest.TestCase):
         assets._data = bytearray(7 * 0x4000)
         assets._chests = (ChestRecord(0, 0x9D, 0, "Locket of Love", True),)
         assets._item_name = Mock(side_effect=lambda item_id: f"Item {item_id:02X}")
+        assets._descriptors = ()
+        assets._area_layouts = {}
         ram = bytearray(0x800)
         ram[0x9B:0x9D] = bytes((77, 88))
 
@@ -152,6 +156,8 @@ class RomAssetLayerTests(unittest.TestCase):
         assets._data[table + 0x19 * 5:table + 0x19 * 5 + 2] = bytes((80, 90))
         assets._chests = ()
         assets._item_name = Mock(side_effect=lambda item_id: f"Item {item_id:02X}")
+        assets._descriptors = ()
+        assets._area_layouts = {}
         flags = bytearray(26)
         flags[203 >> 3] = 0x80 >> (203 & 7)
 
@@ -282,3 +288,45 @@ class RomAssetLayerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class ChestAndShopTileTests(unittest.TestCase):
+    @staticmethod
+    def _assets(tiles, collision, map_id=5):
+        assets = DragonWarrior3RomAssets.__new__(DragonWarrior3RomAssets)
+        assets._area_layouts = {map_id: (tiles, collision)}
+        return assets
+
+    def test_chest_positions_follow_engine_scan_order(self) -> None:
+        collision = [0] * 32
+        collision[7] = 0x03          # chest
+        collision[9] = 0x13          # chest, with unrelated high bits set
+        tiles = (
+            (0, 9, 0),
+            (7, 0, 7),
+        )
+        assets = self._assets(tiles, tuple(collision))
+
+        # row-major, left to right, top to bottom
+        self.assertEqual(assets.chest_positions(5), ((1, 0), (0, 1), (2, 1)))
+
+    def test_chest_positions_ignore_maps_without_layout(self) -> None:
+        self.assertEqual(self._assets((), ()).chest_positions(5), ())
+
+    def test_shop_counter_detected_next_to_player(self) -> None:
+        collision = [0] * 32
+        collision[3] = 0x0D          # counter identified by collision type
+        tiles = ((0, 0, 0), (0, 0, 3), (0, 0, 0))
+        assets = self._assets(tiles, tuple(collision))
+
+        self.assertTrue(assets.shop_counter_nearby(5, 1, 1))
+        self.assertFalse(assets.shop_counter_nearby(5, 0, 0))
+
+    def test_shop_counter_detected_by_tile_id(self) -> None:
+        tiles = ((0, 0x0E),)
+        assets = self._assets(tiles, tuple([0] * 32))
+
+        self.assertTrue(assets.shop_counter_nearby(5, 0, 0))
+
+    def test_shop_counter_ignores_out_of_bounds_neighbours(self) -> None:
+        assets = self._assets(((0,),), tuple([0] * 32))
+        self.assertFalse(assets.shop_counter_nearby(5, 0, 0))

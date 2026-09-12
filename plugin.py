@@ -28,6 +28,10 @@ class DragonWarrior3Plugin:
             assets.item_name if assets is not None else None,
             assets.decode_text if assets is not None else None,
             assets.enemy_profile if assets is not None else None,
+            assets.shop_inventory if assets is not None else None,
+            assets.shop_counter_nearby if assets is not None else None,
+            assets.item_slot if assets is not None else None,
+            assets.item_power if assets is not None else None,
         )
 
     @staticmethod

@@ -701,3 +701,102 @@ class DragonWarrior3AdapterTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class ShopAdvisorTests(unittest.TestCase):
+    @staticmethod
+    def _ram(jobs, equipment, gold=1000, shop=0):
+        ram = bytearray(RAM_SIZE)
+        ram[0x06FF] = shop
+        ram[0x07BC:0x07BF] = gold.to_bytes(3, "little")
+        for index, (job, gender) in enumerate(jobs):
+            ram[0x0718 + index] = job | (gender << 3)
+            ram[0x07C1 + index] = index
+        for index in range(len(jobs), 4):
+            ram[0x07C1 + index] = 0xFF
+        for index, items in enumerate(equipment):
+            for slot, item_id in enumerate(items):
+                ram[0x077C + index * 8 + slot] = 0x80 | item_id
+        return bytes(ram)
+
+    def _adapter(self):
+        slots = {0x17: "weapon", 0x1F: "weapon", 0x26: "armor", 0x46: "helmet"}
+        powers = {0x17: 65, 0x1F: 35, 0x26: 40, 0x46: 25}
+        return DragonWarrior3Adapter(
+            item_slot=lambda item_id: slots.get(item_id),
+            item_power=lambda item_id: powers.get(item_id, 0),
+        )
+
+    def test_party_equipment_reads_only_equipped_entries(self) -> None:
+        ram = self._ram([(4, 0), (3, 1)], [[0x17, 0x46], [0x1F]])
+        # an unequipped duplicate must not override the equipped weapon
+        ram = bytearray(ram)
+        ram[0x077C + 2] = 0x1F
+        members = self._adapter()._party_equipment(bytes(ram))
+
+        self.assertEqual([member.label for member in members], ["P1 Soldier", "P2 Sage"])
+        self.assertEqual(members[0].equipment, {"weapon": 0x17, "helmet": 0x46})
+        self.assertFalse(members[0].female)
+        self.assertTrue(members[1].female)
+
+    def test_party_equipment_skips_absent_members(self) -> None:
+        ram = self._ram([(0, 0)], [[0x17]])
+        self.assertEqual(len(self._adapter()._party_equipment(ram)), 1)
+
+    def test_shop_panel_waits_for_a_fresh_shop_id(self) -> None:
+        from game.rom_assets import ShopItem
+
+        stock = (ShopItem(0x17, "Zombie Slasher", 9800, "weapon", 65, 0xFF, False),)
+        adapter = DragonWarrior3Adapter(
+            item_slot=lambda item_id: {0x17: "weapon", 0x1F: "weapon"}.get(item_id),
+            item_power=lambda item_id: {0x17: 65, 0x1F: 35}.get(item_id, 0),
+            shop_inventory=lambda shop_id: stock,
+            shop_counter_nearby=lambda *_: True,
+        )
+        ram = self._ram([(4, 0)], [[0x1F]], shop=6)
+
+        # a shop id carried over from another town must not be believed
+        self.assertIsNone(adapter._shop_section(ram, 0x0C, (1, 1)))
+        self.assertIsNone(adapter._shop_section(ram, 0x0C, (1, 1)))
+
+        # once it changes, it belongs to the map the player is standing on
+        talked = self._ram([(4, 0)], [[0x1F]], shop=7)
+        section = adapter._shop_section(talked, 0x0C, (1, 1))
+        self.assertIsNotNone(section)
+        self.assertIn("Zombie Slasher", section.rows[1].text)
+
+        # and it is dropped again on a different map
+        self.assertIsNone(adapter._shop_section(talked, 0x0D, (1, 1)))
+
+    def test_shop_panel_hidden_away_from_a_counter(self) -> None:
+        from game.rom_assets import ShopItem
+
+        adapter = DragonWarrior3Adapter(
+            item_slot=lambda item_id: "weapon",
+            item_power=lambda item_id: 1,
+            shop_inventory=lambda shop_id: (
+                ShopItem(0x17, "Zombie Slasher", 9800, "weapon", 65, 0xFF, False),
+            ),
+            shop_counter_nearby=lambda *_: False,
+        )
+        adapter._last_shop_id = 6
+        self.assertIsNone(adapter._shop_section(self._ram([(4, 0)], [[]], shop=7), 0x0C, (1, 1)))
+
+
+class ShopItemTests(unittest.TestCase):
+    @staticmethod
+    def _item(mask, female_only=False):
+        from game.rom_assets import ShopItem
+
+        return ShopItem(0x17, "Zombie Slasher", 9800, "weapon", 65, mask, female_only)
+
+    def test_equip_mask_selects_classes(self) -> None:
+        item = self._item(0x3D)  # hero, pilgrim, sage, soldier, merchant
+        self.assertTrue(item.equippable_by(0, False))
+        self.assertTrue(item.equippable_by(3, False))
+        self.assertFalse(item.equippable_by(1, False))
+        self.assertFalse(item.equippable_by(6, False))
+
+    def test_female_only_items_block_male_members(self) -> None:
+        item = self._item(0xFF, female_only=True)
+        self.assertFalse(item.equippable_by(4, False))
+        self.assertTrue(item.equippable_by(4, True))

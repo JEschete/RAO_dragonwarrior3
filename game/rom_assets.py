@@ -48,6 +48,25 @@ AREA_EXPLICIT_PATTERN_REFS_OFFSET = 0x2DD4
 AREA_PATTERN_DELTAS_OFFSET = 0x3456
 AREA_ATTRIBUTE_TABLE_OFFSET = 0x34DC
 AREA_ATTRIBUTE_INDEX_OFFSET = 0x3594
+SHOP_POINTER_TABLE_OFFSET = 0x27CC
+SHOP_COUNT = 46
+ITEM_EQUIP_MASK_OFFSET = 0x1137
+ITEM_USE_EFFECTS_OFFSET = 0x11AE
+ITEM_EFFECTS_OFFSET = 0x122B
+GEAR_POWER_OFFSET = 0x3990
+GEAR_POWER_COUNT = 0x47
+# The engine finds a chest by scanning the decoded map for this collision type
+# and counting matches; a chest's index is its position in that scan.
+CHEST_COLLISION_TYPE = 0x03
+SHOP_COUNTER_TILE = 0x0E
+SHOP_COUNTER_COLLISION = 0x0D
+EQUIPMENT_SLOT_BOUNDS = (
+    ("weapon", 0x00, 0x20),
+    ("armor", 0x20, 0x38),
+    ("shield", 0x38, 0x3F),
+    ("helmet", 0x3F, 0x47),
+)
+FEMALE_ONLY_ITEMS = frozenset({0x16, 0x31})
 AREA_PALETTE_DATA1_OFFSET = 0x251B
 AREA_PALETTE_DATA2_OFFSET = 0x251F
 AREA_PALETTE_DATA0_OFFSET = 0x2521
@@ -309,6 +328,22 @@ class AreaGraphics:
     patterns: tuple[bytes, ...]
     palette: tuple[int, ...]
     collision: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ShopItem:
+    item_id: int
+    name: str
+    price: int
+    slot: str | None
+    power: int
+    equip_mask: int
+    female_only: bool
+
+    def equippable_by(self, job: int, female: bool) -> bool:
+        if not self.equip_mask & (1 << job):
+            return False
+        return female or not self.female_only
 
 
 @dataclass(frozen=True, slots=True)
@@ -613,6 +648,9 @@ class DragonWarrior3RomAssets:
         self._renderer = renderer
         self._world_renderer = world_renderer
         self._descriptors = self._index_area_maps()
+        self._area_layouts: dict[
+            int, tuple[tuple[tuple[int, ...], ...], tuple[int, ...]]
+        ] = {}
         self._chests = self._index_chests()
         self._npc_lists = self._index_npc_lists()
 
@@ -653,6 +691,7 @@ class DragonWarrior3RomAssets:
                 image_loader=lambda map_key=key: self.render_world_map(map_key),
                 waypoints=self._world_waypoints(area),
                 regions=self._world_encounter_regions(area),
+                wraps=True,
             )
             for key, (title, area, _, height, width) in WORLD_MAP_SPECS.items()
         )
@@ -925,6 +964,111 @@ class DragonWarrior3RomAssets:
             lists.append(tuple(records))
         return tuple(lists)
 
+    def item_slot(self, item_id: int) -> str | None:
+        """Equipment slot an item occupies, or None if it is not gear."""
+        for slot, start, end in EQUIPMENT_SLOT_BOUNDS:
+            if start <= item_id < end:
+                return slot
+        return None
+
+    def item_power(self, item_id: int) -> int:
+        """Attack power for a weapon, defence for armour, shields and helmets."""
+        if not 0 <= item_id < GEAR_POWER_COUNT:
+            return 0
+        return self._data[self._address(9, GEAR_POWER_OFFSET) + item_id]
+
+    def item_price(self, item_id: int) -> int:
+        """Shop price, stored as a mantissa plus a power-of-ten exponent."""
+        base = self._address(0, ITEM_EFFECTS_OFFSET)
+        exponent = self._address(0, ITEM_USE_EFFECTS_OFFSET)
+        return (self._data[base + item_id] & 0x7F) * 10 ** (
+            self._data[exponent + item_id] & 0x03
+        )
+
+    def shop_inventory(self, shop_id: int) -> tuple[ShopItem, ...]:
+        """Items a shop stocks. The final entry is flagged with bit 7."""
+        if not 0 <= shop_id < SHOP_COUNT:
+            return ()
+        table = self._address(0x0D, SHOP_POINTER_TABLE_OFFSET) + shop_id * 2
+        pointer = int.from_bytes(self._data[table:table + 2], "little")
+        if not 0x8000 <= pointer < 0xC000:
+            return ()
+        offset = self._address(0x0D, pointer - 0x8000)
+        equip_mask = self._address(0, ITEM_EQUIP_MASK_OFFSET)
+        items = []
+        for step in range(32):
+            value = self._data[offset + step]
+            item_id = value & 0x7F
+            items.append(
+                ShopItem(
+                    item_id,
+                    self._item_name(item_id),
+                    self.item_price(item_id),
+                    self.item_slot(item_id),
+                    self.item_power(item_id),
+                    self._data[equip_mask + item_id],
+                    item_id in FEMALE_ONLY_ITEMS,
+                )
+            )
+            if value & 0x80:
+                break
+        return tuple(items)
+
+    def _area_layout(self, map_id: int) -> tuple[tuple[tuple[int, ...], ...], tuple[int, ...]]:
+        """Decoded tiles and collision flags for a map, decoded at most once."""
+        cached = self._area_layouts.get(map_id)
+        if cached is not None:
+            return cached
+        descriptor = next(
+            (item for item in self._descriptors if item.map_id == map_id), None
+        )
+        if descriptor is None:
+            layout: tuple[tuple[tuple[int, ...], ...], tuple[int, ...]] = ((), ())
+        else:
+            decoder = MdecDecoder(self._data, descriptor.data_offset)
+            graphics = self._area_graphics(descriptor)
+            tiles = self._apply_wall_faces(
+                decoder.decode(),
+                graphics.collision,
+                descriptor.tileset,
+                decoder.oob_tile,
+            )
+            layout = (tiles, graphics.collision)
+        self._area_layouts[map_id] = layout
+        return layout
+
+    def chest_positions(self, map_id: int) -> tuple[tuple[int, int], ...]:
+        """Chest tiles in the order the engine counts them, top-left first."""
+        tiles, collision = self._area_layout(map_id)
+        if not tiles or len(collision) < 32:
+            return ()
+        return tuple(
+            (x, y)
+            for y, row in enumerate(tiles)
+            for x, value in enumerate(row)
+            if collision[value & 0x1F] & 0x0F == CHEST_COLLISION_TYPE
+        )
+
+    def shop_counter_nearby(self, map_id: int, x: int, y: int) -> bool:
+        """Whether the player is standing at a shop counter.
+
+        Shopkeepers are served across a desk, so the counter tile rather than
+        the shopkeeper is what the player walks up to.
+        """
+        tiles, collision = self._area_layout(map_id)
+        if not tiles or len(collision) < 32:
+            return False
+        for offset_x, offset_y in ((0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)):
+            target_x, target_y = x + offset_x, y + offset_y
+            if not 0 <= target_y < len(tiles) or not 0 <= target_x < len(tiles[0]):
+                continue
+            tile = tiles[target_y][target_x] & 0x1F
+            if tile == SHOP_COUNTER_TILE:
+                return True
+            if collision[tile] & 0x0F == SHOP_COUNTER_COLLISION:
+                return True
+        return False
+
     def collectible_overlays(
         self,
         chest_flags: bytes,
@@ -973,6 +1117,7 @@ class DragonWarrior3RomAssets:
                     self._chest_is_open(chest_flags, chest.global_index)
                     for chest in map_chests
                 ]
+                self._append_area_chests(overlays, map_id, map_chests, statuses)
                 remaining = statuses.count(False)
                 detail = "\n".join(
                     f"{'Collected' if opened else 'Available'}: {chest.description}"
@@ -1066,6 +1211,40 @@ class DragonWarrior3RomAssets:
                     completed,
                 )
             )
+
+    def _append_area_chests(
+        self,
+        overlays: dict[str, list[MapWaypoint]],
+        map_id: int,
+        chests: list[ChestRecord],
+        statuses: list[bool],
+    ) -> None:
+        """Pin each chest to its own tile on the map it sits in.
+
+        A handful of chests are placed by story events rather than by the map
+        data, so their tiles are missing here. Matching on the exact count
+        keeps the remaining maps aligned instead of labelling chests wrongly.
+        """
+        positions = self.chest_positions(map_id)
+        if len(positions) != len(self._chests_on_map(map_id)):
+            return
+        for chest, opened in zip(chests, statuses):
+            if chest.local_index >= len(positions):
+                continue
+            x, y = positions[chest.local_index]
+            overlays.setdefault(f"area-{map_id:02x}", []).append(
+                MapWaypoint(
+                    x,
+                    y,
+                    chest.description,
+                    "Collected" if opened else "Available",
+                    "collectibles",
+                    opened,
+                )
+            )
+
+    def _chests_on_map(self, map_id: int) -> tuple[ChestRecord, ...]:
+        return tuple(chest for chest in self._chests if chest.map_id == map_id)
 
     @staticmethod
     def _chest_is_open(chest_flags: bytes, global_index: int) -> bool:
