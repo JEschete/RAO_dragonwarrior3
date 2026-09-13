@@ -1,7 +1,9 @@
 import unittest
 import tempfile
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
+
+from PIL import Image
 
 from game.rom_assets import AreaGraphics, AreaMapDescriptor, ChestRecord, DragonWarrior3RomAssets, MdecDecoder, NpcMetadata, WorldGraphics, decode_world_row
 from map_renderer import NES_PALETTE, render_area_map, render_world_map
@@ -284,6 +286,60 @@ class RomAssetLayerTests(unittest.TestCase):
                 self.assertEqual(image.getpixel((0, 0)), NES_PALETTE[0x30])
                 self.assertEqual(image.getpixel((1, 0)), NES_PALETTE[0x17])
                 self.assertEqual(image.getpixel((2, 0)), NES_PALETTE[0x0F])
+
+    def test_failed_map_write_does_not_leave_a_cached_image(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "maps" / "area.png"
+            graphics = AreaGraphics(
+                ((0, 0, 0, 0),),
+                (0,),
+                (bytes(16),),
+                (0x0F, 0x10, 0x20) * 4,
+            )
+
+            def fail_after_partial_write(
+                _image: Image.Image,
+                path: Path,
+                **_kwargs,
+            ) -> None:
+                Path(path).write_bytes(b"partial")
+                raise OSError("render interrupted")
+
+            with patch.object(Image.Image, "save", fail_after_partial_write):
+                with self.assertRaisesRegex(OSError, "render interrupted"):
+                    render_area_map(((0,),), graphics, output)
+
+            self.assertFalse(output.exists())
+            self.assertEqual(tuple(output.parent.iterdir()), ())
+
+    def test_area_render_reuses_an_existing_cache_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            assets = DragonWarrior3RomAssets.__new__(DragonWarrior3RomAssets)
+            assets.cache_directory = Path(directory)
+            assets._descriptors = (AreaMapDescriptor(0x34, 5, 1, 1, 0),)
+            assets._renderer = Mock()
+            output = assets.cache_directory / "maps" / "area-34.png"
+            output.parent.mkdir()
+            output.write_bytes(b"cached")
+
+            self.assertEqual(assets.render_area_map(0x34), output)
+            assets._renderer.assert_not_called()
+
+    def test_extractor_cache_invalidation_removes_only_stale_versions(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            versions = Path(directory)
+            current = versions / "vcurrent"
+            stale = versions / "vstale"
+            current.mkdir()
+            stale.mkdir()
+            (stale / "partial.png").write_bytes(b"stale")
+            assets = DragonWarrior3RomAssets.__new__(DragonWarrior3RomAssets)
+            assets.cache_directory = current
+
+            assets._discard_stale_caches(versions)
+
+            self.assertTrue(current.is_dir())
+            self.assertFalse(stale.exists())
 
 
 if __name__ == "__main__":

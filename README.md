@@ -14,6 +14,12 @@ The overworld, Alefgard, towns, and dungeons render from the ROM's native NES pa
 
 The map toolbar exposes independent checkboxes for the player, Hero's path, entrances, collectibles, NPCs, and enemy regions. Entrance and enemy names come from the ROM; treasure markers combine all 193 chest records with scripted search items and use SRAM flags to mark collected items. The Phantom Ship marker follows its live world coordinates. Local NPC markers use the active map's live NPC positions.
 
+Generated PNGs are committed to the local cache with atomic replacement. A failed or interrupted render cannot leave a partial image that is accepted as a valid cache entry on the next open.
+
+## Qt host integration
+
+The plugin is UI-toolkit neutral and emits immutable keyed panel and map documents. The default PySide6 host provides semantic area, party, goals, and urgent views, preserves expanded details across live updates, and renders the same world, local-map, NPC, collectible, objective, encounter, and Hero-path data. The host's explicit `--ui tk` mode remains the temporary rollback path.
+
 ## Battle dashboard
 
 During battle, route and collection sections are replaced by focused enemy, party, and spell sections. Hover an enemy or party row for live combat stats and statuses. When a supported ROM is configured, enemy hover details also include base stats and rewards decoded from its enemy records.
@@ -26,3 +32,5 @@ Run the plugin tests from this repository with the framework source available on
 $env:PYTHONPATH = "..\..\src;."
 ..\..\.venv\Scripts\python.exe -m pytest -q tests
 ```
+
+The Qt migration acceptance suite currently passes 86 tests.

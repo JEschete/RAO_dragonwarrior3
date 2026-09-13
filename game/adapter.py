@@ -225,6 +225,19 @@ class DragonWarrior3Adapter:
         self._item_slot = item_slot
         self._item_power = item_power
 
+    def activate(self, _content_key: tuple[str, str, str]) -> None:
+        self.reset_session()
+
+    def deactivate(self) -> None:
+        self.reset_session()
+
+    def reset_session(self) -> None:
+        self._previous = None
+        self._unlocked.clear()
+        self._recent_items.clear()
+        self._last_shop_id = None
+        self._shop_context = None
+
     def supports(self, status: RetroArchStatus, content_hash: str | None = None) -> bool:
         core = status.core.casefold().replace(" ", "_")
         if not any(name in core for name in ("mesen", "nestopia", "fceumm", "fceux", "nes")):
@@ -301,8 +314,11 @@ class DragonWarrior3Adapter:
                                 PanelRow(self._item_detail(item_id), item_id in ITEM_ACHIEVEMENTS)
                                 for item_id in self._recent_items
                             ),
+                            key="recent-items",
                         ),
                     ),
+                    role="party",
+                    key="recent-items",
                 )
             )
         map_overlays = list(
@@ -382,7 +398,13 @@ class DragonWarrior3Adapter:
             rows.append(PanelRow("No upgrades here for this party", True))
         gold = int.from_bytes(ram[0x07BC:0x07BF], "little")
         rows.insert(0, PanelRow(f"Gold on hand: {gold}G"))
-        return PanelSection("Shop upgrades", tuple(rows), priority=5, role="context")
+        return PanelSection(
+            "Shop upgrades",
+            tuple(rows),
+            priority=5,
+            role="area",
+            key="shop-upgrades",
+        )
 
     def _party_equipment(self, ram: bytes) -> tuple[PartyMember, ...]:
         members = []
@@ -492,11 +514,29 @@ class DragonWarrior3Adapter:
                     "OPEN CURRENT STEPS",
                     "What To Do Next",
                     self._current_route_rows(steps, current_index),
+                    key="current-steps",
                 ),
-                PanelAction("OPEN ROUTE PLAN", "Dragon Warrior III Route Plan", self._route_plan_rows(state, area)),
-                PanelAction("OPEN KEY ITEM UNLOCKS", "Key Item Unlocks", self._key_item_rows(state)),
-                PanelAction("OPEN RA PRIORITIES", "RetroAchievements Priorities", self._ra_priority_rows(state)),
+                PanelAction(
+                    "OPEN ROUTE PLAN",
+                    "Dragon Warrior III Route Plan",
+                    self._route_plan_rows(state, area),
+                    key="route-plan",
+                ),
+                PanelAction(
+                    "OPEN KEY ITEM UNLOCKS",
+                    "Key Item Unlocks",
+                    self._key_item_rows(state),
+                    key="key-item-unlocks",
+                ),
+                PanelAction(
+                    "OPEN RA PRIORITIES",
+                    "RetroAchievements Priorities",
+                    self._ra_priority_rows(state),
+                    key="ra-priorities",
+                ),
             ),
+            role="goals",
+            key="current-objective",
         )
 
     def _current_objective(self, state: GameState, area: str) -> tuple[str, str]:
@@ -643,11 +683,17 @@ class DragonWarrior3Adapter:
                 "Castle of Baramos",
             ),
             RouteStep(
-                "Next: Aliahan · report victory",
-                "Complete the interrupted celebration, collect the Sphere of Light, and enter the Great Pit of Giaga.",
+                "Next: Castle of the Dragon Queen · Sphere of Light",
+                "After the interrupted celebration, obtain the Sphere of Light before facing Zoma.",
+                "The World of Darkness",
+                complete(0x72),
+                "Castle of the Dragon Queen",
+            ),
+            RouteStep(
+                "Next: Great Pit of Giaga",
+                "Enter the pit east of Baramos's Castle and descend into Alefgard.",
                 "The World of Darkness",
                 state.alefgard_open,
-                "Aliahan Town",
             ),
             RouteStep(
                 "Next: gather Alefgard's legendary items",
@@ -937,8 +983,15 @@ class DragonWarrior3Adapter:
             "Unlocks",
             tuple(rows),
             actions=(
-                PanelAction("OPEN UNLOCK DETAILS", "Key Item Unlocks", self._key_item_rows(state)),
+                PanelAction(
+                    "OPEN UNLOCK DETAILS",
+                    "Key Item Unlocks",
+                    self._key_item_rows(state),
+                    key="unlock-details",
+                ),
             ),
+            role="goals",
+            key="unlocks",
         )
 
     def _orb_section(self, state: GameState) -> PanelSection:
@@ -956,7 +1009,16 @@ class DragonWarrior3Adapter:
             "Orb route",
             tuple(rows),
             alert=state.orbs_found >= 6 and state.orbs_placed < 6,
-            actions=(PanelAction("OPEN ORB CHECKLIST", "Orb Checklist", detail_rows),),
+            actions=(
+                PanelAction(
+                    "OPEN ORB CHECKLIST",
+                    "Orb Checklist",
+                    detail_rows,
+                    key="orb-checklist",
+                ),
+            ),
+            role="goals",
+            key="orb-route",
         )
 
     def _resource_section(self, ram: bytes, state: GameState) -> PanelSection:
@@ -991,7 +1053,16 @@ class DragonWarrior3Adapter:
             "Resources",
             tuple(rows),
             alert=bool(self._party_warnings(ram, state)),
-            actions=(PanelAction("OPEN RESOURCE PLAN", "Resource Plan", detail_rows),),
+            actions=(
+                PanelAction(
+                    "OPEN RESOURCE PLAN",
+                    "Resource Plan",
+                    detail_rows,
+                    key="resource-plan",
+                ),
+            ),
+            role="party",
+            key="resources",
         )
 
     def _achievement_detail_rows(self) -> tuple[PanelRow, ...]:
@@ -1229,7 +1300,16 @@ class DragonWarrior3Adapter:
             "RetroAchievements",
             tuple(rows),
             preview_limit=7,
-            actions=(PanelAction("OPEN ACHIEVEMENTS", "RetroAchievements", self._achievement_detail_rows()),),
+            actions=(
+                PanelAction(
+                    "OPEN ACHIEVEMENTS",
+                    "RetroAchievements",
+                    self._achievement_detail_rows(),
+                    key="achievements",
+                ),
+            ),
+            role="goals",
+            key="retroachievements",
         )
 
     def _party_section(self, ram: bytes, state: GameState) -> PanelSection:
@@ -1266,10 +1346,32 @@ class DragonWarrior3Adapter:
             detail_rows.append(PanelRow("Waiting for a loaded save"))
         detail_rows.extend(self._class_plan_rows(state))
         detail_rows.extend(self._recovery_rows(ram, state))
+        if rows:
+            eligible_count = sum(
+                state.party_ids[index] != 0xFF
+                and level >= 20
+                and state.jobs[index] not in {0, 3}
+                for index, level in enumerate(state.levels)
+            )
+            rows.append(
+                PanelRow(
+                    f"Dhama readiness: {eligible_count} eligible for class change",
+                    emphasis="warning" if eligible_count else "",
+                )
+            )
         return PanelSection(
             "Party",
             tuple(rows) or (PanelRow("Waiting for a loaded save"),),
-            actions=(PanelAction("OPEN PARTY PLAN", "Party Plan", tuple(detail_rows)),),
+            actions=(
+                PanelAction(
+                    "OPEN PARTY PLAN",
+                    "Party Plan",
+                    tuple(detail_rows),
+                    key="party-plan",
+                ),
+            ),
+            role="party",
+            key="party",
         )
 
     def _battle_section(self, ram: bytes) -> PanelSection:
@@ -1382,6 +1484,7 @@ class DragonWarrior3Adapter:
             tuple(rows) or (PanelRow("Battle starting"),),
             priority=1,
             role="urgent",
+            key="battle",
         )
 
     def _battle_party_section(
@@ -1435,6 +1538,7 @@ class DragonWarrior3Adapter:
             tuple(rows) or (PanelRow("Waiting for party data"),),
             priority=2,
             role="urgent",
+            key="battle-party",
         )
 
     def _battle_spell_section(self, ram: bytes, state: GameState) -> PanelSection:
@@ -1478,6 +1582,7 @@ class DragonWarrior3Adapter:
             preview_limit=12,
             priority=3,
             role="urgent",
+            key="battle-spells",
         )
 
     def _enemy_label(self, enemy_id: int) -> str:
@@ -1544,10 +1649,27 @@ class DragonWarrior3Adapter:
                 PanelRow(f"Vault items {vault_count}/128"),
             ),
             actions=(
-                PanelAction("OPEN COMPLETION PLAN", "Completion Plan", self._completion_rows(state, vault_count)),
-                PanelAction("OPEN CHEST CHECKLISTS", "Chest Checklists", self._chest_rows(state)),
-                PanelAction("OPEN VAULT AUDIT", "Vault Audit", self._vault_rows(sram)),
+                PanelAction(
+                    "OPEN COMPLETION PLAN",
+                    "Completion Plan",
+                    self._completion_rows(state, vault_count),
+                    key="completion-plan",
+                ),
+                PanelAction(
+                    "OPEN CHEST CHECKLISTS",
+                    "Chest Checklists",
+                    self._chest_rows(state),
+                    key="chest-checklists",
+                ),
+                PanelAction(
+                    "OPEN VAULT AUDIT",
+                    "Vault Audit",
+                    self._vault_rows(sram),
+                    key="vault-audit",
+                ),
             ),
+            role="goals",
+            key="adventure-progress",
         )
 
     def _world_section(self, ram: bytes) -> PanelSection:
@@ -1563,10 +1685,27 @@ class DragonWarrior3Adapter:
             ),
             preview_limit=3,
             actions=(
-                PanelAction("OPEN RETURN LIST", "Return Destinations", self._return_rows(town_names)),
-                PanelAction("OPEN TRAVEL AIDS", "Travel Aids", self._travel_aid_rows(ram)),
-                PanelAction("OPEN TIME WINDOWS", "Time Windows", tuple(PanelRow(row) for row in TIME_WINDOWS)),
+                PanelAction(
+                    "OPEN RETURN LIST",
+                    "Return Destinations",
+                    self._return_rows(town_names),
+                    key="return-list",
+                ),
+                PanelAction(
+                    "OPEN TRAVEL AIDS",
+                    "Travel Aids",
+                    self._travel_aid_rows(ram),
+                    key="travel-aids",
+                ),
+                PanelAction(
+                    "OPEN TIME WINDOWS",
+                    "Time Windows",
+                    tuple(PanelRow(row) for row in TIME_WINDOWS),
+                    key="time-windows",
+                ),
             ),
+            role="area",
+            key="travel",
         )
 
     @staticmethod

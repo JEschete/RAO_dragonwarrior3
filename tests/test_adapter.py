@@ -1,3 +1,4 @@
+import ast
 import tempfile
 import unittest
 from io import BytesIO
@@ -50,6 +51,35 @@ class DescriptorlessMemory:
 
 
 class DragonWarrior3AdapterTests(unittest.TestCase):
+    def test_every_panel_section_and_action_declares_a_stable_key(self) -> None:
+        path = Path(__file__).resolve().parents[1] / "game" / "adapter.py"
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        missing = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+                continue
+            if node.func.id not in {"PanelSection", "PanelAction"}:
+                continue
+            if not any(keyword.arg == "key" for keyword in node.keywords):
+                missing.append((node.func.id, node.lineno))
+
+        self.assertEqual(missing, [])
+
+    def test_overworld_snapshot_has_unique_semantic_presentation_identity(self) -> None:
+        snapshot = DragonWarrior3Adapter().snapshot(FakeMemory())
+
+        keys = tuple(section.key for section in snapshot.sections)
+        self.assertTrue(all(keys))
+        self.assertEqual(len(keys), len(set(keys)))
+        self.assertTrue(
+            all(action.key for section in snapshot.sections for action in section.actions)
+        )
+        roles = {section.key: section.role for section in snapshot.sections}
+        self.assertEqual(roles["current-objective"], "goals")
+        self.assertEqual(roles["party"], "party")
+        self.assertEqual(roles["resources"], "party")
+        self.assertEqual(roles["travel"], "area")
+
     def test_loads_account_achievement_progress(self) -> None:
         response = BytesIO(
             b'{"Achievements":{"50439":{"DateEarned":"2024-01-01"},'
@@ -120,7 +150,7 @@ class DragonWarrior3AdapterTests(unittest.TestCase):
         self.assertTrue(snapshot.supports_caught_filter)
         objective = next(section for section in snapshot.sections if section.title == "Current objective")
         self.assertEqual(objective.rows[0].text, "Next: recruit a full party")
-        self.assertEqual(objective.rows[2].text, "Walkthrough progress 0/20")
+        self.assertEqual(objective.rows[2].text, "Walkthrough progress 0/21")
         self.assertEqual(
             tuple(action.label for action in objective.actions),
             (
@@ -154,6 +184,32 @@ class DragonWarrior3AdapterTests(unittest.TestCase):
         party = next(section for section in snapshot.sections if section.title == "Party")
         self.assertTrue(party.rows[0].text.startswith("Jacob · Hero Lv 20"))
 
+    def test_party_summarizes_dhama_class_change_readiness(self) -> None:
+        memory = FakeMemory()
+        memory.ram[0x0701:0x0703] = bytes((20, 20))
+
+        snapshot = DragonWarrior3Adapter().snapshot(memory)
+        party = next(section for section in snapshot.sections if section.key == "party")
+
+        self.assertEqual(
+            party.rows[-1].text,
+            "Dhama readiness: 2 eligible for class change",
+        )
+        self.assertIsNone(party.rows[-1].caught)
+        self.assertEqual(party.rows[-1].emphasis, "warning")
+
+    def test_empty_party_retains_waiting_state(self) -> None:
+        memory = FakeMemory()
+        memory.ram[0x07C1:0x07C5] = bytes((0xFF,)) * 4
+
+        snapshot = DragonWarrior3Adapter().snapshot(memory)
+        party = next(section for section in snapshot.sections if section.key == "party")
+
+        self.assertEqual(
+            tuple(row.text for row in party.rows),
+            ("Waiting for a loaded save",),
+        )
+
     def test_snapshot_has_no_map_document_without_plugin_resources(self) -> None:
         snapshot = DragonWarrior3Adapter().snapshot(FakeMemory())
 
@@ -178,6 +234,23 @@ class DragonWarrior3AdapterTests(unittest.TestCase):
         self.assertIn("With a Little Help from My Friends", detected)
         self.assertIn("A New Line of Work", detected)
         self.assertIn("So Much Magic", detected)
+
+    def test_content_activation_resets_session_observations_and_shop_trust(self) -> None:
+        adapter = DragonWarrior3Adapter()
+        memory = FakeMemory()
+        adapter.snapshot(memory)
+        memory.ram[0x077C] = 0x58
+        adapter.snapshot(memory)
+        adapter._last_shop_id = 7
+        adapter._shop_context = (12, 7)
+
+        adapter.activate(("mesen", "other-rom", "crc"))
+
+        self.assertIsNone(adapter._previous)
+        self.assertEqual(adapter._unlocked, set())
+        self.assertEqual(tuple(adapter._recent_items), ())
+        self.assertIsNone(adapter._last_shop_id)
+        self.assertIsNone(adapter._shop_context)
 
     def test_new_unique_item_is_named_and_detects_achievement(self) -> None:
         adapter = DragonWarrior3Adapter()
@@ -281,6 +354,35 @@ class DragonWarrior3AdapterTests(unittest.TestCase):
             if section.title == "Current objective"
         )
         self.assertEqual(objective.rows[0].text, "Next: Shrine in the Shoals · Final Key")
+
+    def test_post_baramos_route_requires_sphere_before_alefgard(self) -> None:
+        memory = FakeMemory()
+        memory.ram[0x0703] = 10
+        memory.ram[0x07C4] = 3
+        memory.ram[0x0743] = 0x80
+        memory.sram[0xCB] = 0x80
+        memory.sram[0xCE:0xD1] = bytes((0x3F, 0x3F, 0x3F))
+        adapter = DragonWarrior3Adapter()
+
+        sphere_snapshot = adapter.snapshot(memory)
+        objective = next(
+            section
+            for section in sphere_snapshot.sections
+            if section.key == "current-objective"
+        )
+        self.assertEqual(
+            objective.rows[0].text,
+            "Next: Castle of the Dragon Queen · Sphere of Light",
+        )
+
+        memory.sram[0xCA] = 0x40
+        pit_snapshot = adapter.snapshot(memory)
+        objective = next(
+            section
+            for section in pit_snapshot.sections
+            if section.key == "current-objective"
+        )
+        self.assertEqual(objective.rows[0].text, "Next: Great Pit of Giaga")
 
     def test_consumed_book_of_satori_uses_persistent_chest_flag(self) -> None:
         memory = FakeMemory()
