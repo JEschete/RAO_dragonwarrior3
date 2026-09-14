@@ -44,11 +44,9 @@ owned by the base application.
   versions are removed without touching the current version.
 - The complete plugin suite passes with 86 tests and no warnings.
 
-## Rollback And Non-Goals
+## Non-Goals
 
-The same toolkit-neutral plugin remains available through the host's explicit
-`--ui tk` fallback until final Tk removal. No plugin-specific rollback fork is
-required.
+The plugin remains toolkit-neutral and has no plugin-specific renderer fork.
 
 Installer, accessibility, native-platform, and performance acceptance are not
 phase gates under decisions D-010 through D-014 in the governing migration plan.

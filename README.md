@@ -18,7 +18,7 @@ Generated PNGs are committed to the local cache with atomic replacement. A faile
 
 ## Qt host integration
 
-The plugin is UI-toolkit neutral and emits immutable keyed panel and map documents. The default PySide6 host provides semantic area, party, goals, and urgent views, preserves expanded details across live updates, and renders the same world, local-map, NPC, collectible, objective, encounter, and Hero-path data. The host's explicit `--ui tk` mode remains the temporary rollback path.
+The plugin is UI-toolkit neutral and emits immutable keyed panel and map documents. The PySide6 host provides semantic area, party, goals, and urgent views, preserves expanded details across live updates, and renders the same world, local-map, NPC, collectible, objective, encounter, and Hero-path data.
 
 ## Battle dashboard
 
